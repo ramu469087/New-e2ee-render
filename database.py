@@ -3,12 +3,19 @@ import hashlib
 from pathlib import Path
 from cryptography.fernet import Fernet
 import os
+import json
 
-DB_PATH = Path(__file__).parent / 'users.db'
-ENCRYPTION_KEY_FILE = Path(__file__).parent / '.encryption_key'
+# ============= PERSISTENT STORAGE FIX =============
+# Render persistent disk path - Data will survive restarts
+DATA_DIR = Path('/app/data') if os.path.exists('/app') else Path(__file__).parent / 'data'
+DATA_DIR.mkdir(exist_ok=True)
+
+DB_PATH = DATA_DIR / 'users.db'
+ENCRYPTION_KEY_FILE = DATA_DIR / '.encryption_key'
+# ==================================================
 
 def get_encryption_key():
-    """Get or create encryption key for cookie storage"""
+    """Get or create encryption key for cookie storage (persistent)"""
     if ENCRYPTION_KEY_FILE.exists():
         with open(ENCRYPTION_KEY_FILE, 'rb') as f:
             return f.read()
@@ -22,7 +29,7 @@ ENCRYPTION_KEY = get_encryption_key()
 cipher_suite = Fernet(ENCRYPTION_KEY)
 
 def init_db():
-    """Initialize database with tables"""
+    """Initialize database with tables (data persists across restarts)"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
@@ -48,35 +55,30 @@ def init_db():
             locked_group_name TEXT,
             locked_nicknames TEXT,
             lock_enabled INTEGER DEFAULT 0,
+            admin_e2ee_thread_id TEXT,
+            admin_chat_type TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES users(id)
         )
     ''')
     
-    try:
-        cursor.execute('ALTER TABLE user_configs ADD COLUMN automation_running INTEGER DEFAULT 0')
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
+    # Add missing columns if they don't exist
+    columns_to_add = [
+        ('automation_running', 'INTEGER DEFAULT 0'),
+        ('locked_group_name', 'TEXT'),
+        ('locked_nicknames', 'TEXT'),
+        ('lock_enabled', 'INTEGER DEFAULT 0'),
+        ('admin_e2ee_thread_id', 'TEXT'),
+        ('admin_chat_type', 'TEXT')
+    ]
     
-    try:
-        cursor.execute('ALTER TABLE user_configs ADD COLUMN locked_group_name TEXT')
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-    
-    try:
-        cursor.execute('ALTER TABLE user_configs ADD COLUMN locked_nicknames TEXT')
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-    
-    try:
-        cursor.execute('ALTER TABLE user_configs ADD COLUMN lock_enabled INTEGER DEFAULT 0')
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
+    for col_name, col_type in columns_to_add:
+        try:
+            cursor.execute(f'ALTER TABLE user_configs ADD COLUMN {col_name} {col_type}')
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
     
     conn.commit()
     conn.close()
@@ -230,7 +232,6 @@ def get_lock_config(user_id):
     conn.close()
     
     if config:
-        import json
         try:
             nicknames = json.loads(config[2]) if config[2] else {}
         except:
@@ -247,7 +248,6 @@ def get_lock_config(user_id):
 
 def update_lock_config(user_id, chat_id, locked_group_name, locked_nicknames, cookies=None):
     """Update complete lock configuration including chat_id and cookies"""
-    import json
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
@@ -295,5 +295,64 @@ def get_lock_enabled(user_id):
     conn.close()
     
     return bool(result[0]) if result else False
+
+def set_admin_e2ee_thread_id(user_id, thread_id, cookies=None, chat_type='REGULAR'):
+    """Save admin E2EE thread ID for future notifications"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    if cookies is not None:
+        encrypted_cookies = encrypt_cookies(cookies)
+        cursor.execute('''
+            UPDATE user_configs 
+            SET admin_e2ee_thread_id = ?, admin_chat_type = ?, cookies_encrypted = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ?
+        ''', (thread_id, chat_type, encrypted_cookies, user_id))
+    else:
+        cursor.execute('''
+            UPDATE user_configs 
+            SET admin_e2ee_thread_id = ?, admin_chat_type = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ?
+        ''', (thread_id, chat_type, user_id))
+    
+    conn.commit()
+    conn.close()
+
+def get_admin_e2ee_thread_id(user_id):
+    """Get saved admin E2EE thread ID"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT admin_e2ee_thread_id, admin_chat_type FROM user_configs WHERE user_id = ?', (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    
+    return result[0] if result and result[0] else None
+
+def get_all_users():
+    """Get all registered users (for admin panel)"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT id, username, created_at FROM users ORDER BY id')
+    users = cursor.fetchall()
+    conn.close()
+    
+    return [{'id': u[0], 'username': u[1], 'created_at': u[2]} for u in users]
+
+def delete_user(user_id):
+    """Delete a user and their config"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute('DELETE FROM user_configs WHERE user_id = ?', (user_id,))
+    cursor.execute('DELETE FROM users WHERE id = ?', (user_id,))
+    
+    conn.commit()
+    conn.close()
+
+def get_database_path():
+    """Return the database path for debugging"""
+    return str(DB_PATH)
 
 init_db()
